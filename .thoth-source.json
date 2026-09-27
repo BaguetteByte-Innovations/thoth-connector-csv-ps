@@ -1,0 +1,10 @@
+{
+  "about": "Fingerprint of the sources this snapshot was exported from. Thoth release notes use it to tell which version of this repository matches the copy embedded in the Thoth installers.",
+  "sources": [
+    {
+      "project": "Thoth.Connectors.CsvPs",
+      "fingerprint": "sha256:e20216fce5610fd2e294b2892d22cf4b167487056e33ea63d2c74e4e53a9173b",
+      "clean": true
+    }
+  ]
+}
