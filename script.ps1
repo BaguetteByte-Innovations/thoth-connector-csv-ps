@@ -660,6 +660,7 @@ function Build-Identity([string[]]$values, $options, $layout) {
     Add-IfNotNull $id 'TeacherPedagogicalGroups' (Get-RawScopedList (Get-RawField $values $idx.TeacherGroups)   $options.ListDelimiter $options.ScopeDelimiter $lineSchool)
     Add-IfNotNull $id 'TeacherSubjects'          (Get-RawScopedList (Get-RawField $values $idx.TeacherSubjects) $options.ListDelimiter $options.ScopeDelimiter $lineSchool)
     Add-IfNotNull $id 'Description'              (Get-RawField $values $idx.Description)
+    Add-IfNotNull $id 'Mail'                     (Get-RawField $values $idx.Mail)
 
     return $id
 }
@@ -675,7 +676,7 @@ function Build-Identity([string[]]$values, $options, $layout) {
 # 'Scope' is NOT in this list: residence folds like a scalar but its conflicts are counted, not
 # reported one by one (see Merge-Residence).
 $ScalarFields = @('SourceId', 'SamAccountName', 'UserPrincipalName', 'FirstName', 'LastName',
-                  'BirthDate', 'Class', 'Description')
+                  'BirthDate', 'Class', 'Description', 'Mail')
 
 # Lists: concatenated, NEVER deduplicated - the engine deduplicates, and the contract forbids a
 # connector from cleaning what it reads.
@@ -961,6 +962,7 @@ function Process-File($source, [string]$sourceLabel, $mapping, $options, [string
             TeacherGroups      = (Get-ColumnIndex 'TeacherPedagogicalGroups' $mapping $headers $options.HasHeader)
             TeacherSubjects    = (Get-ColumnIndex 'TeacherSubjects'          $mapping $headers $options.HasHeader)
             Description        = (Get-ColumnIndex 'Description'              $mapping $headers $options.HasHeader)
+            Mail               = (Get-ColumnIndex 'Mail'                     $mapping $headers $options.HasHeader)
         }
 
         $layout = @{

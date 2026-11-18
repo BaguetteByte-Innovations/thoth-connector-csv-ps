@@ -6,7 +6,7 @@
 #     . "$PSScriptRoot\thoth-protocol.ps1"
 #
 # This file contains NO source-specific parsing logic.
-# It only wraps the communication protocol with Thoth.Engine.
+# It only wraps the communication protocol with Thoth Engine.
 # Reference: https://thoth-iam.com/docs/develop/reference/powershell-module/
 # =====================================================================
 
