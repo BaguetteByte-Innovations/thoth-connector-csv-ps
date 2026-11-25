@@ -28,7 +28,7 @@ function Emit-Identity($id) {
 # $sourceFields: names of the fields the source exposes to the mapping (for a CSV, its columns).
 # Always emitted, even empty - empty for a fixed schema, whose $samples are then keyed by target
 # identifiers (ThothRawIdentity property names) instead of source field names.
-function Emit-InspectionResult([bool]$success, [bool]$requiresMapping, [string[]]$sourceFields, $samples, [string]$err, [string]$fixedRole, $connectorTargets = $null) {
+function Emit-InspectionResult([bool]$success, [bool]$requiresMapping, [string[]]$sourceFields, $samples, [string]$err, [string]$fixedRole, $connectorTargets = $null, [bool]$providesIdentities = $true, [string[]]$crossReferenceTargets = @()) {
     $payload = @{
         Success               = $success
         RequiresManualMapping = $requiresMapping
@@ -40,6 +40,10 @@ function Emit-InspectionResult([bool]$success, [bool]$requiresMapping, [string[]
     # ConnectorTargets are the connector's OWN mapping targets, offered next to the engine's. The
     # engine relays them without reading them, and the chosen column comes back in the mapping.
     if ($connectorTargets) { $payload.ConnectorTargets = @($connectorTargets) }
+    # A source that describes no one (false) gets the connector's targets only; written for false only.
+    if (-not $providesIdentities) { $payload.ProvidesIdentities = $false }
+    # Targets on which the ingestion will cross-reference the records of a same person; written only if any.
+    if ($crossReferenceTargets.Count -gt 0) { $payload.CrossReferenceTargets = @($crossReferenceTargets) }
     # ExpectedTargets is engine-owned: the engine fills it from FixedRole at inspection.
     # A connector never produces it.
     [Console]::Out.WriteLine("res:$($payload | ConvertTo-Json -Compress -Depth 10)")

@@ -10,9 +10,10 @@
 #   one  (default) - one row is one person, rows are streamed straight out.
 #   many           - several rows may describe the SAME person (three files, one per school; or a
 #                    long-format export with one row per teaching assignment). Rows are
-#                    cross-referenced on an anchor cell and folded into a single identity. The
-#                    manifest declares JoinSourcesWhen on that mode, so the engine hands every
-#                    source over in ONE call.
+#                    cross-referenced on an anchor cell and folded into a single identity. Rows
+#                    fold across every source of one launch: the engine hands every file of an
+#                    interactive import over in a single launch, and every source of one
+#                    ingestion of an autonomous import.
 #
 # Merging is NOT cleaning: the anchor is normalized to COMPARE only, lists are concatenated
 # without deduplication (the engine owns the Distinct), and values travel raw.
@@ -59,6 +60,14 @@ function Test-Merging($ctx) {
 function Get-Cleaned([string]$value) {
     if ([string]::IsNullOrWhiteSpace($value)) { return $null }
     return $value.Trim()
+}
+
+# Target on which the rows of a same person are cross-referenced. One reading for the inspection,
+# which announces it, and the ingestion, which applies it.
+function Get-MergeAnchor($ctx) {
+    $mergeAnchor = Get-Cleaned (Get-Param $ctx 'merge_anchor' $null)
+    if ($null -eq $mergeAnchor) { return 'SamAccountName' }
+    return $mergeAnchor
 }
 
 # An operator-facing refusal: its message is surfaced AS-IS in the ingestion result, without the
@@ -632,8 +641,8 @@ function Build-Identity([string[]]$values, $options, $layout) {
     $singleSchool = Get-SingleSchool $schools
     $lineSchool   = if ($null -ne $singleSchool) { $singleSchool } else { $layout.FileScope }
 
-    # Residence: the mapped column cell > the batch's transverse district > the school stated on the
-    # file > null, which the engine backfills with the default scope.
+    # Residence: the cascade is stated in Resolve-Residence, and Merge-Residence applies it to a
+    # person folded from several rows.
     #
     # The file's school is handed over RAW, for every role alike: the ENGINE interprets it
     # (a student's school is their residence, a teacher's or a staff member's resolves to that
@@ -643,15 +652,10 @@ function Build-Identity([string[]]$values, $options, $layout) {
     # The transverse district is the ONE role-conditioned term, and it is so because the SETTING is:
     # its VisibleWhen restricts it to teachers and staff, while it is asked once for the whole call.
     # A mixed batch would otherwise leak it onto the students.
-    #
-    # The blank check serves ONLY the choice between cell and fallback: the retained value (cell OR
-    # fallback) is passed RAW, and the engine sanitizes/uppercases.
-    $scopeCell           = Get-RawField $values $idx.Scope
-    $transverseDistrict  = if ($options.Role -in @('Teacher', 'Staff')) { $options.ResidenceDistrict } else { $null }
-    $scopeFallback       = if ($null -ne $transverseDistrict) { $transverseDistrict } else { $layout.FileScope }
-    $scope               = if ([string]::IsNullOrWhiteSpace($scopeCell)) { $scopeFallback } else { $scopeCell }
+    $transverseDistrict = if ($options.Role -in @('Teacher', 'Staff')) { $options.ResidenceDistrict } else { $null }
+    $residence          = Resolve-Residence (Get-RawField $values $idx.Scope) $transverseDistrict $layout.FileScope
 
-    Add-IfNotNull $id 'Scope'       $scope
+    Add-IfNotNull $id 'Scope'       $residence.Value
     Add-IfNotNull $id 'Class'       (Get-RawField $values $idx.Class)
 
     Add-IfNotNull $id 'StudentPedagogicalGroups' (Get-RawList (Get-RawField $values $idx.StudentGroups) $options.ListDelimiter)
@@ -662,7 +666,7 @@ function Build-Identity([string[]]$values, $options, $layout) {
     Add-IfNotNull $id 'Description'              (Get-RawField $values $idx.Description)
     Add-IfNotNull $id 'Mail'                     (Get-RawField $values $idx.Mail)
 
-    return $id
+    return @{ Identity = $id; ResidenceOrigin = $residence.Origin }
 }
 
 # ---------------------------------------------------------------------
@@ -673,10 +677,25 @@ function Build-Identity([string[]]$values, $options, $layout) {
 # BirthDate belongs here: the protocol already carries it as a 'yyyy-MM-dd' string, so it
 # compares like any other scalar.
 #
-# 'Scope' is NOT in this list: residence folds like a scalar but its conflicts are counted, not
-# reported one by one (see Merge-Residence).
+# 'Scope' is NOT in this list: its fold follows the residence cascade (see Merge-Residence).
 $ScalarFields = @('SourceId', 'SamAccountName', 'UserPrincipalName', 'FirstName', 'LastName',
                   'BirthDate', 'Class', 'Description', 'Mail')
+
+# Origin of a residence, from the weakest to the strongest term of the cascade: the numeric order
+# IS the precedence. Same values as ResidenceOrigin in the native flavor.
+$ResidenceOrigin = @{ None = 0; FileSchool = 1; TransverseDistrict = 2; Column = 3 }
+
+# The residence of ONE row: the mapped column cell > the batch's transverse district > the school
+# stated on the file > nothing. Returns the value AND the term it comes from, which the fold needs
+# to apply the same cascade to a person read over several files (see Merge-Residence).
+# The blank check serves ONLY the choice between the cell and what follows: the retained value
+# travels RAW, and the engine sanitizes it.
+function Resolve-Residence($cell, $transverseDistrict, $fileSchool) {
+    if (-not [string]::IsNullOrWhiteSpace($cell)) { return @{ Value = $cell; Origin = $ResidenceOrigin.Column } }
+    if ($null -ne $transverseDistrict) { return @{ Value = $transverseDistrict; Origin = $ResidenceOrigin.TransverseDistrict } }
+    if ($null -ne $fileSchool) { return @{ Value = $fileSchool; Origin = $ResidenceOrigin.FileSchool } }
+    return @{ Value = $null; Origin = $ResidenceOrigin.None }
+}
 
 # Lists: concatenated, NEVER deduplicated - the engine deduplicates, and the contract forbids a
 # connector from cleaning what it reads.
@@ -713,12 +732,15 @@ function New-MergeBuffer {
         ByKey      = New-Object 'System.Collections.Generic.Dictionary[string,int]' ([System.StringComparer]::OrdinalIgnoreCase)
         Identities = New-Object 'System.Collections.Generic.List[hashtable]'
         Anchors    = New-Object 'System.Collections.Generic.List[string]'
-        # Residence divergences of the whole run, said once at the flush (see Merge-Residence).
-        ResidenceConflicts = 0
+        # Origin of each kept residence (the identity carries the value): never emitted.
+        ResidenceOrigins     = New-Object 'System.Collections.Generic.List[int]'
+        # People whose rows disagree on their residence at its current origin, with the first value
+        # ignored. Judged at the flush: a stronger origin read later settles the disagreement.
+        ResidenceDivergences = New-Object 'System.Collections.Generic.Dictionary[int,string]'
     }
 }
 
-function Add-MergeFragment($buffer, [string]$role, [string]$anchor, [hashtable]$identity) {
+function Add-MergeFragment($buffer, [string]$role, [string]$anchor, [hashtable]$identity, [int]$residenceOrigin) {
     $trimmed  = $anchor.Trim()
     # NUL cannot appear in a line read by ReadLine, so no anchor can spoof another role's key.
     $key      = "$role$([char]0)$trimmed"
@@ -728,11 +750,13 @@ function Add-MergeFragment($buffer, [string]$role, [string]$anchor, [hashtable]$
         $buffer.ByKey[$key] = $buffer.Identities.Count
         [void]$buffer.Identities.Add($identity)
         [void]$buffer.Anchors.Add($trimmed)
+        [void]$buffer.ResidenceOrigins.Add($residenceOrigin)
         return
     }
 
     # Hashtables are reference types: folding mutates the kept fragment in place.
-    Merge-Identity $buffer $buffer.Identities[$position] $identity $buffer.Anchors[$position]
+    Merge-Identity $buffer.Identities[$position] $identity $buffer.Anchors[$position]
+    Merge-Residence $buffer $position $identity $residenceOrigin
 }
 
 # Emits the folded identities in order of first appearance and returns their count, split by role.
@@ -745,8 +769,18 @@ function Emit-MergeBuffer($buffer) {
         Add-RoleCount $tally $identity.Role 1
     }
 
-    if ($buffer.ResidenceConflicts -gt 0) {
-        Emit-Log 'Warning' ("$($buffer.ResidenceConflicts) people appear in several files stating different schools: " +
+    # Two schools of files disagreeing is a defect OF THE BATCH: said once, counting people. Two STATED
+    # residences disagreeing (two residence columns) is a defect OF THE PERSON: named, like a
+    # divergent first name.
+    $schoolConflicts = 0
+    foreach ($entry in $buffer.ResidenceDivergences.GetEnumerator()) {
+        if ($buffer.ResidenceOrigins[$entry.Key] -eq $ResidenceOrigin.FileSchool) { $schoolConflicts++; continue }
+        $kept = $buffer.Identities[$entry.Key]['Scope'].Trim()
+        Emit-Log 'Warning' "'$($buffer.Anchors[$entry.Key])': conflicting 'Scope' across rows — kept '$kept', ignored '$($entry.Value)'."
+    }
+
+    if ($schoolConflicts -gt 0) {
+        Emit-Log 'Warning' ("$schoolConflicts people appear in several files stating different schools: " +
             "each kept the residence of the first file read. Map a Residence column, or fill " +
             "'residence_district', to state it explicitly.")
     }
@@ -754,10 +788,9 @@ function Emit-MergeBuffer($buffer) {
     return $tally
 }
 
-function Merge-Identity($buffer, [hashtable]$kept, [hashtable]$incoming, [string]$anchor) {
+function Merge-Identity([hashtable]$kept, [hashtable]$incoming, [string]$anchor) {
     foreach ($field in $ScalarFields) { Merge-Scalar $kept $incoming $field $anchor }
     foreach ($field in $ListFields)   { Merge-List   $kept $incoming $field }
-    Merge-Residence $buffer $kept $incoming
 }
 
 # First non-empty wins. A later fragment disagreeing is reported as a warning, never as a failure:
@@ -777,18 +810,27 @@ function Merge-Scalar([hashtable]$kept, [hashtable]$incoming, [string]$field, [s
     }
 }
 
-# Residence folds like any other scalar - first non-empty wins - but its conflicts are counted
-# rather than reported one by one. A divergent first name is a defect OF THE PERSON, so naming them
-# is the useful thing; a divergent residence is a defect OF THE BATCH (per-school exports that never
-# state where people live), and repeating it per person buries the one line that matters.
-function Merge-Residence($buffer, [hashtable]$kept, [hashtable]$incoming) {
-    $new = $incoming['Scope']
-    if ([string]::IsNullOrWhiteSpace($new)) { return }
+# The residence of ONE person: the cascade of Resolve-Residence, applied across its rows. The
+# stronger origin wins whatever the order; a weaker one is dropped without a word, as within a row.
+# Between two values of the SAME origin the first read stays (the rule of every scalar), and the
+# disagreement is noted for Emit-MergeBuffer.
+function Merge-Residence($buffer, [int]$position, [hashtable]$incoming, [int]$incomingOrigin) {
+    $kept       = $buffer.Identities[$position]
+    $keptOrigin = $buffer.ResidenceOrigins[$position]
+
+    if ($incomingOrigin -gt $keptOrigin) {
+        $kept['Scope'] = $incoming['Scope']
+        $buffer.ResidenceOrigins[$position] = $incomingOrigin
+        [void]$buffer.ResidenceDivergences.Remove($position)
+        return
+    }
+    if ($incomingOrigin -lt $keptOrigin -or $keptOrigin -eq $ResidenceOrigin.None) { return }
 
     $old = $kept['Scope']
-    if ([string]::IsNullOrWhiteSpace($old)) { $kept['Scope'] = $new; return }
-
-    if ($old.Trim() -ine $new.Trim()) { $buffer.ResidenceConflicts++ }
+    $new = $incoming['Scope']
+    if ($old.Trim() -ine $new.Trim() -and -not $buffer.ResidenceDivergences.ContainsKey($position)) {
+        $buffer.ResidenceDivergences[$position] = $new.Trim()
+    }
 }
 
 function Merge-List([hashtable]$kept, [hashtable]$incoming, [string]$field) {
@@ -909,7 +951,10 @@ function Invoke-Inspect($req) {
             $rowsRead++
         }
 
-        Emit-InspectionResult $true $true $columns.ToArray() $samples.ToArray() $null $targetRole
+        # The inspection only repeats the operator's answer, read from the CALL like the ingestion
+        # does: nothing is looked up in the file.
+        $crossReferenceTargets = if (Test-Merging $ctx) { @(Get-MergeAnchor $ctx) } else { @() }
+        Emit-InspectionResult $true $true $columns.ToArray() $samples.ToArray() $null $targetRole $null $true $crossReferenceTargets
     } finally {
         $reader.Dispose()
     }
@@ -918,10 +963,10 @@ function Invoke-Inspect($req) {
 # Turns one CSV line into an identity: emitted straight away in `one` mode (returns 1), buffered
 # for folding in `many` mode (returns 0 - the population is only known at the end of the run).
 function Add-Row([string[]]$values, [int]$number, $options, $layout, [string]$sourceLabel, [int]$anchorIndex, $buffer) {
-    $identity = Build-Identity $values $options $layout
+    $row = Build-Identity $values $options $layout
 
     if ($null -eq $buffer) {
-        Emit-Identity $identity
+        Emit-Identity $row.Identity
         return 1
     }
 
@@ -932,7 +977,7 @@ function Add-Row([string[]]$values, [int]$number, $options, $layout, [string]$so
         throw (New-IngestRefusal "Cross-referencing is enabled but line $number of '$sourceLabel' has no value in the column mapped to '$($options.MergeAnchor)'.")
     }
 
-    Add-MergeFragment $buffer $options.Role $anchor $identity
+    Add-MergeFragment $buffer $options.Role $anchor $row.Identity $row.ResidenceOrigin
     return 0
 }
 
@@ -1030,8 +1075,7 @@ function Invoke-Ingest($req) {
 
     # Cross-referencing stays a decision of the CALL: it folds the sources of one call together, so
     # it cannot differ from one source to the next.
-    $mergeAnchor = Get-Cleaned (Get-Param $ctx 'merge_anchor' $null)
-    if ($null -eq $mergeAnchor) { $mergeAnchor = 'SamAccountName' }
+    $mergeAnchor = Get-MergeAnchor $ctx
 
     $merging = Test-Merging $ctx
 
